@@ -1,0 +1,206 @@
+$Id$
+
+-------------------------------------------------
+RUNTIME SELF MODIFYING CODE AND BINARY ENCRYPTION
+-------------------------------------------------
+
+Questo articolo documenta come e' possibile realizzare un' eseguibile crittato
+utilizzando stream ciphers in modo alternativo ai sistemi noti (dacryfile,
+burneye..). Testato su NetBSD 1.5.2, Linux 2.4.18. Per consigli, bug fixes,
+idee o altro: xenion@acidlife.com
+
+                                        -- Dallachiesa Michele aka xenion
+
+
+
+--[ RUNTIME SELF MODIFYING CODE
+
+
+Vediamo come e' possibile sovrascrivere i segmenti eseguibili mappati 
+a runtime: solitamente i segmenti eseguibili non possono essere sovrascritti
+perche mappati r-x, tocchera' quindi a noi forzare i flags riguardanti la 
+protezione di memoria. Per fare questo e' necessario analizzare alcune 
+strutture presenti nel nostro file e modificarne il contenuto.
+L'header principale degli ELF si trova ad offset 0x00 ed e' di tipo 
+Elf32_Ehdr (elf header). Da /usr/include/elf.h:
+
+typedef struct
+{
+  unsigned char e_ident[EI_NIDENT];     /* Magic number and other info */
+  Elf32_Half    e_type;                 /* Object file type */
+  Elf32_Half    e_machine;              /* Architecture */
+  Elf32_Word    e_version;              /* Object file version */
+  Elf32_Addr    e_entry;                /* Entry point virtual address */
+  Elf32_Off     e_phoff;                /* Program header table file offset */
+  Elf32_Off     e_shoff;                /* Section header table file offset */
+  Elf32_Word    e_flags;                /* Processor-specific flags */
+  Elf32_Half    e_ehsize;               /* ELF header size in bytes */
+  Elf32_Half    e_phentsize;            /* Program header table entry size */
+  Elf32_Half    e_phnum;                /* Program header table entry count */
+  Elf32_Half    e_shentsize;            /* Section header table entry size */
+  Elf32_Half    e_shnum;                /* Section header table entry count */
+  Elf32_Half    e_shstrndx;             /* Section header string table index */
+} Elf32_Ehdr;
+
+I segmenti mappati a runtime sono descritti da una struttura di tipo Elf32_Phdr
+(program header). Il membro e_phoff contiene l'offset alla prima struttura ed
+e_phnum il loro numero. Il file risulta cosi' strutturato:
+
+--------------------
+[elf header]        
+...
+[program header 1]
+[program header 2]
+[program header ..]
+[program header n]
+...
+--------------------
+
+Sempre da /usr/include/elf.h:
+
+typedef struct
+{
+  Elf32_Word    p_type;                 /* Segment type */
+  Elf32_Off     p_offset;               /* Segment file offset */
+  Elf32_Addr    p_vaddr;                /* Segment virtual address */
+  Elf32_Addr    p_paddr;                /* Segment physical address */
+  Elf32_Word    p_filesz;               /* Segment size in file */
+  Elf32_Word    p_memsz;                /* Segment size in memory */
+  Elf32_Word    p_flags;                /* Segment flags */
+  Elf32_Word    p_align;                /* Segment alignment */
+} Elf32_Phdr;
+
+Il membro p_flags contiene i flags che descrivono la protezione di memoria 
+del segmento ed e' dato dalle combinazioni OR di:
+
+#define PF_X            (1 << 0)        /* Segment is executable */
+#define PF_W            (1 << 1)        /* Segment is writable */
+#define PF_R            (1 << 2)        /* Segment is readable */
+#define PF_MASKOS       0x0ff00000      /* OS-specific */
+#define PF_MASKPROC     0xf0000000      /* Processor-specific */
+
+Bene, abbiamo trovato dove e cosa modificare :)
+
+
+
+--[ VIRTUAL ADDRESS TO FILE OFFSET
+
+
+objdump, readelf e nm ci dicono l'indirizzo virtuale delle funzioni a runtime
+ma non l'offset all'interno dell'ELF.. vediamo quindi una possibile soluzione:
+Le nostre funzioni sono mappate a runtime, saranno quindi contenute nei 
+segmenti visti in precedenza. La struttura Elf32_Phdr ci dice esattamente
+dove verra' mappato il segmento (p_vaddr), la sua lunghezza su file (p_filesz)
+e il suo offset all'interno del file (p_offset). Bastera' quindi scorrere tutti
+i program headers presenti, sicuramente uno di questi descrivera' un segmento
+contenente anche la nostra funzione:
+
+unsigned long virtual_addr;	// indirizzo virtuale della funzione
+Elf32_Phdr elfProgram;		// struttura di tipo program header
+
+if (elfProgram->p_vaddr <= virtual_addr &&
+    elfProgram->p_vaddr + elfProgram->p_filesz >= virtual_addr)
+    printf("virtual address %#lx has file offset %#lx\n", virtual_addr,
+           elfProgram->p_offset + (virtual_addr - elfProgram->p_vaddr));
+
+
+
+--[ BINARY ENCRYPTION USING STREAM CIPHERS
+
+
+Andremo a crittare una parte dell'ELF, non tutto. Sara' il main() a decrittare
+le funzioni rendendole utilizzabili. Questo rende tutto molto piu semplice,
+anche se meno elegante, meno potente e meno sicuro. 
+..vediamo come fare un ELF con una funzione crittata: prendiamo secret()
+dell'esempio che segue.
+
+--[ sample.c ]------------------------------------------------------
+
+// cc sample.c bf/blowfish.a -o sample
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "bf/blowfish.h"
+
+#define F_LEN 24
+
+void
+secret()
+{
+    printf("Ya, this is my secret!\n");
+}
+
+int
+main(int argc, char **argv, char **envp)
+{
+    struct {
+        BF_KEY          key;
+        int             enc;
+        int             num;
+        unsigned char   ivec[8];
+    } bf;
+
+    BF_set_key(&bf.key, strlen(getenv("KEY")), getenv("KEY"));
+    memset(bf.ivec, '\0', 8);
+    bf.num = 0;
+
+    BF_cfb64_encrypt((unsigned char *) secret, (unsigned char *) secret,
+                     F_LEN, bf.key, bf.ivec, &bf.num, BF_DECRYPT);
+
+    secret();
+
+    return 0;
+}
+
+--[ sample.c ]------------------------------------------------------
+
+A priori non conosciamo la sua dimensione in memoria, quindi compiliamo prima
+con una lunghezza fasulla, vediamo con readelf(2) quanto vale realmente e
+fixiamo il sorgente (F_LEN):
+
+$ readelf -a sample | grep secret
+    89: 08048490    24 FUNC    GLOBAL DEFAULT   12 secret
+
+La nostra funzione a runtime viene mappata a partire da 0x08048490 ed e' lunga 
+24 byte.. ricompiliamo con F_LEN settato propriamente.
+Andiamo ora a vedere l'offset della funzione all'interno del file:
+
+$ bin/elfo -f sample -a 0x08048490
+virtual address 0x8048490 has file offset 0x490
+
+Bene, ora conosciamo l'offset all'interno del file. Lo crittiamo quindi da
+offset 0x490 ad offset 0x490+24:
+
+$ bin/bud -f sample -s 0x490 -l 24 -k j4m -e
+Encrypting file from <0x490> to <0x490+0x18>..
+Done.
+
+Cambiamo ora la protezione di memoria dei segmenti:
+
+$ bin/elfo -f sample -p
+SEGMENT 0 is executable, PATCHING!
+SEGMENT 2 is executable, PATCHING!
+ELF patched, have fun ;)
+
+Ok, testiamo
+
+$ ./sample
+Segmentation fault
+$ KEY=j4m ./sample
+Ya, this is my secret!
+$
+
+funziona :)
+
+--[ EOF
+
+Sicuramente meno elegante, potente e sicuro di burneye, rimane comunque la
+soluzione piu semplice (e opensource..).
+
+--[ REFERENCES
+
+http://www.phrack.org/show.php?p=58&a=5 
+http://www.big.net.au/~silvio/elf-pv.txt
+binutils (ftp.gnu.org/gnu/binutils/)
+
+
